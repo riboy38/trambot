@@ -279,6 +279,10 @@ async def delete_notification(callback: CallbackQuery, bot: Bot):
 async def process_add_channel(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=main_menu_keyboard())
+        return
     channel = message.text.strip()
     if not channel.startswith("@"):
         channel = "@" + channel
@@ -293,6 +297,10 @@ async def process_add_channel(message: Message, state: FSMContext):
 @router.message(AdminStates.removing_channel)
 async def process_remove_channel(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
+        return
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=main_menu_keyboard())
         return
     channel = message.text.strip()
     if not channel.startswith("@"):
@@ -309,6 +317,10 @@ async def process_remove_channel(message: Message, state: FSMContext):
 async def process_add_keyword(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=main_menu_keyboard())
+        return
     word = message.text.strip().lower()
     added = await db.add_keyword(word)
     await message.answer(
@@ -322,6 +334,10 @@ async def process_add_keyword(message: Message, state: FSMContext):
 async def process_remove_keyword(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=main_menu_keyboard())
+        return
     word = message.text.strip().lower()
     removed = await db.remove_keyword(word)
     await message.answer(
@@ -334,6 +350,11 @@ async def process_remove_keyword(message: Message, state: FSMContext):
 @router.message(AdminStates.creating_broadcast)
 async def process_broadcast(message: Message, state: FSMContext, bot: Bot):
     if not is_admin(message.from_user.id):
+        return
+    # Если администратор ввёл команду — не отправлять как уведомление
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=main_menu_keyboard())
         return
     text = message.text or message.caption or ""
     photo_file_id = message.photo[-1].file_id if message.photo else None
