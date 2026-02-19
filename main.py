@@ -1,12 +1,10 @@
 """
 Главный файл запуска.
 Запускает aiogram-бота и Telethon userbot параллельно через asyncio.
+Все файлы лежат в корне репозитория (плоская структура).
 """
 
 import asyncio
-import sys
-import os as _os
-sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import logging
 import os
 
@@ -15,11 +13,11 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
-from db import database as db
-from bot.handlers import router as user_router
-from bot.admin import router as admin_router
-from bot.moderation import router as moderation_router
-from monitor.watcher import ChannelWatcher
+import database as db
+from handlers import router as user_router
+from admin import router as admin_router
+from moderation import router as moderation_router
+from watcher import ChannelWatcher
 
 # Загружаем переменные окружения из .env (для локальной разработки)
 load_dotenv()
@@ -63,7 +61,6 @@ async def broadcast_relevant_message(
     for user_id in subscribers:
         try:
             if photo and watcher:
-                # Отправляем через userbot, т.к. у нас Telethon-медиа объект
                 msg_id = await watcher.send_message_to_user(
                     user_id, notification_text, photo=photo
                 )
@@ -90,7 +87,6 @@ async def broadcast_relevant_message(
         except Exception as e:
             err_str = str(e).lower()
             if "blocked" in err_str or "user is deactivated" in err_str or "bot was blocked" in err_str:
-                # Пользователь заблокировал бота — удаляем из подписчиков
                 await db.remove_subscriber(user_id)
                 logger.info(f"Удалён подписчик {user_id} — бот заблокирован")
             else:
@@ -103,20 +99,16 @@ async def main():
         logger.error("Не заданы обязательные переменные окружения!")
         return
 
-    # Инициализация базы данных
     logger.info("Подключение к базе данных...")
     await db.init_db(DATABASE_URL)
 
-    # Создание aiogram бота и диспетчера
     bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Регистрация роутеров
-    dp.include_router(admin_router)       # Сначала admin (более специфичные хендлеры)
-    dp.include_router(moderation_router)  # Потом модерация
-    dp.include_router(user_router)        # Затем пользовательские
+    dp.include_router(admin_router)
+    dp.include_router(moderation_router)
+    dp.include_router(user_router)
 
-    # Создание Telethon userbot
     watcher = ChannelWatcher(
         api_id=TELETHON_API_ID,
         api_hash=TELETHON_API_HASH,
@@ -134,7 +126,6 @@ async def main():
     await watcher.start()
 
     logger.info("Запуск aiogram бота...")
-    # Запускаем оба компонента параллельно
     await asyncio.gather(
         dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()),
         watcher.run_until_disconnected()
