@@ -1,0 +1,142 @@
+"""
+Главный файл запуска.
+Запускает aiogram-бота и Telethon userbot параллельно через asyncio.
+"""
+
+import asyncio
+import logging
+import os
+
+from aiogram import Bot, Dispatcher
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
+from dotenv import load_dotenv
+
+from db import database as db
+from bot.handlers import router as user_router
+from bot.admin import router as admin_router
+from bot.moderation import router as moderation_router
+from monitor.watcher import ChannelWatcher
+
+# Загружаем переменные окружения из .env (для локальной разработки)
+load_dotenv()
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+# Переменные окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TELETHON_API_ID = int(os.getenv("TELETHON_API_ID", "0"))
+TELETHON_API_HASH = os.getenv("TELETHON_API_HASH")
+TELETHON_SESSION = os.getenv("TELETHON_SESSION")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+async def broadcast_relevant_message(
+    bot: Bot,
+    channel: str,
+    text: str,
+    photo=None,
+    telethon_message=None,
+    watcher: ChannelWatcher = None
+):
+    """
+    Рассылка релевантного сообщения из канала всем подписчикам.
+    Если есть медиа — используем userbot для отправки через Telethon.
+    """
+    subscribers = await db.get_all_subscribers()
+    notification_text = (
+        f"🚃 <b>Уведомление о трамваях Тулы</b>\n\n"
+        f"Источник: {channel}\n\n"
+        f"{text}"
+    )
+
+    for user_id in subscribers:
+        try:
+            if photo and watcher:
+                # Отправляем через userbot, т.к. у нас Telethon-медиа объект
+                msg_id = await watcher.send_message_to_user(
+                    user_id, notification_text, photo=photo
+                )
+                if msg_id:
+                    await db.save_notification(
+                        user_id=user_id,
+                        message_id=msg_id,
+                        text=notification_text,
+                        source_channel=channel,
+                        photo_file_id="telethon"
+                    )
+            else:
+                msg = await bot.send_message(
+                    user_id,
+                    text=notification_text,
+                    parse_mode=ParseMode.HTML
+                )
+                await db.save_notification(
+                    user_id=user_id,
+                    message_id=msg.message_id,
+                    text=notification_text,
+                    source_channel=channel
+                )
+        except Exception as e:
+            err_str = str(e).lower()
+            if "blocked" in err_str or "user is deactivated" in err_str or "bot was blocked" in err_str:
+                # Пользователь заблокировал бота — удаляем из подписчиков
+                await db.remove_subscriber(user_id)
+                logger.info(f"Удалён подписчик {user_id} — бот заблокирован")
+            else:
+                logger.error(f"Ошибка при рассылке пользователю {user_id}: {e}")
+
+
+async def main():
+    """Точка входа: инициализация БД, запуск бота и userbot."""
+    if not all([BOT_TOKEN, TELETHON_API_ID, TELETHON_API_HASH, TELETHON_SESSION, DATABASE_URL]):
+        logger.error("Не заданы обязательные переменные окружения!")
+        return
+
+    # Инициализация базы данных
+    logger.info("Подключение к базе данных...")
+    await db.init_db(DATABASE_URL)
+
+    # Создание aiogram бота и диспетчера
+    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    dp = Dispatcher(storage=MemoryStorage())
+
+    # Регистрация роутеров
+    dp.include_router(admin_router)       # Сначала admin (более специфичные хендлеры)
+    dp.include_router(moderation_router)  # Потом модерация
+    dp.include_router(user_router)        # Затем пользовательские
+
+    # Создание Telethon userbot
+    watcher = ChannelWatcher(
+        api_id=TELETHON_API_ID,
+        api_hash=TELETHON_API_HASH,
+        session_string=TELETHON_SESSION,
+        get_keywords_fn=db.get_keywords,
+        get_channels_fn=db.get_source_channels,
+        on_relevant_message_fn=lambda **kwargs: broadcast_relevant_message(
+            bot=bot,
+            watcher=watcher,
+            **kwargs
+        )
+    )
+
+    logger.info("Запуск Telethon userbot...")
+    await watcher.start()
+
+    logger.info("Запуск aiogram бота...")
+    # Запускаем оба компонента параллельно
+    await asyncio.gather(
+        dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()),
+        watcher.run_until_disconnected()
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
