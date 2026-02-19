@@ -4,6 +4,9 @@
 """
 
 import asyncio
+import sys
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import logging
 import os
 
