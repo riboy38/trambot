@@ -185,13 +185,12 @@ async def save_notification(
 
 
 async def get_notifications_history(offset: int = 0, limit: int = 10) -> list[dict]:
-    """Получить историю уведомлений с пагинацией (группировка по тексту+источнику)."""
+    """Получить историю уведомлений с пагинацией."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT DISTINCT ON (text, source_channel, sent_at::date)
-               id, source_channel, text, photo_file_id, sent_at
+            """SELECT id, source_channel, text, photo_file_id, sent_at
                FROM sent_notifications
-               ORDER BY sent_at::date DESC, sent_at DESC
+               ORDER BY sent_at DESC
                LIMIT $1 OFFSET $2""",
             limit, offset
         )

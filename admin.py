@@ -214,7 +214,12 @@ async def admin_history(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return await callback.answer()
     page = int(callback.data.split(":")[2])
-    items = await db.get_notifications_history(offset=page * 10, limit=10)
+    try:
+        items = await db.get_notifications_history(offset=page * 10, limit=10)
+    except Exception as e:
+        logger.error(f"Ошибка загрузки истории: {e}")
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
     if not items:
         await callback.answer("Нет уведомлений.", show_alert=True)
         return
