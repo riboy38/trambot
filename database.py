@@ -279,3 +279,22 @@ async def get_pending_posts_count() -> int:
         return await conn.fetchval(
             "SELECT COUNT(*) FROM suggested_posts WHERE status = 'pending'"
         )
+
+
+async def fix_channel_urls():
+    """
+    Исправляет каналы, добавленные как полные ссылки.
+    Например @https://t.me/tula_smi → @tula_smi
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, channel FROM source_channels")
+        for row in rows:
+            channel = row["channel"]
+            # Убираем лишнее: @https://t.me/ или https://t.me/
+            if "t.me/" in channel:
+                clean = "@" + channel.split("t.me/")[-1].strip("/")
+                await conn.execute(
+                    "UPDATE source_channels SET channel = $1 WHERE id = $2",
+                    clean, row["id"]
+                )
+                logger.info(f"Исправлен канал: {channel!r} → {clean!r}")
