@@ -125,7 +125,21 @@ async def main():
     )
 
     logger.info("Запуск Telethon userbot...")
-    await watcher.start()
+    # Повторные попытки подключения если сессия занята (Railway поднимает два экземпляра при редеплое)
+    for attempt in range(10):
+        try:
+            await watcher.start()
+            break
+        except Exception as e:
+            if "AuthKeyDuplicated" in str(e) or "auth key" in str(e).lower():
+                wait = 10 * (attempt + 1)
+                logger.warning(f"Сессия занята, ожидаем {wait} сек (попытка {attempt + 1}/10)...")
+                await asyncio.sleep(wait)
+            else:
+                raise
+    else:
+        logger.error("Не удалось запустить userbot после 10 попыток")
+        return
 
     logger.info("Запуск aiogram бота...")
     await asyncio.gather(
