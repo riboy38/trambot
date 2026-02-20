@@ -19,6 +19,7 @@ CHECK_INTERVAL = 30
 
 # RSS источники (пробуем несколько на случай недоступности)
 RSS_TEMPLATES = [
+    "https://tgstat.ru/channel/@{channel}/rss",
     "https://rsshub.app/telegram/channel/{channel}",
     "https://rss.app/feeds/telegram/{channel}.xml",
 ]
