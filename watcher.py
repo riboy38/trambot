@@ -41,6 +41,15 @@ class ChannelWatcher:
         if new_channels:
             logger.info(f"Новые каналы для мониторинга: {new_channels}")
         self._watched_channels = set(channels)
+        logger.info(f"Отслеживаемые каналы: {self._watched_channels}")
+
+        # Проверяем, состоит ли userbot в каждом канале
+        for channel in self._watched_channels:
+            try:
+                entity = await self.client.get_entity(channel)
+                logger.info(f"✅ Канал найден и доступен: {channel} (id={entity.id})")
+            except Exception as e:
+                logger.error(f"❌ Канал недоступен: {channel} — {e}")
 
     async def _channel_refresh_loop(self):
         while True:
@@ -65,9 +74,13 @@ class ChannelWatcher:
                 return
             keywords = await self.get_keywords()
             text_lower = text.lower()
-            if not any(kw in text_lower for kw in keywords):
+            # Логируем каждое сообщение из отслеживаемых каналов для отладки
+            logger.info(f"[{channel_key}] Новое сообщение: {text[:120]!r}")
+            matched = [kw for kw in keywords if kw in text_lower]
+            if not matched:
+                logger.info(f"[{channel_key}] Не найдено ключевых слов, пропускаем")
                 return
-            logger.info(f"Релевантное сообщение из {channel_key}: {text[:80]}...")
+            logger.info(f"[{channel_key}] Совпавшие ключевые слова: {matched}")
             photo = message.media if isinstance(message.media, MessageMediaPhoto) else None
             await self.on_relevant_message(
                 channel=channel_key,
