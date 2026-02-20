@@ -37,8 +37,8 @@ class ChannelWatcher:
         # Загружаем каналы из БД
         await self._refresh_channels()
 
-        # Один глобальный обработчик всех входящих сообщений
-        self.client.add_event_handler(self._handle_new_message, events.NewMessage)
+        # Один глобальный обработчик всех входящих сообщений (включая каналы)
+        self.client.add_event_handler(self._handle_new_message, events.NewMessage(incoming=True))
 
         logger.info(f"Слушаем {len(self._channel_ids)} каналов: {list(self._channel_ids.values())}")
 
