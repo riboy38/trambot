@@ -72,11 +72,16 @@ class ChannelWatcher:
     async def _handle_new_message(self, event: events.NewMessage.Event):
         """Глобальный обработчик — фильтруем по списку каналов."""
         try:
-            # Получаем id чата
-            chat_id = event.chat_id
-            # Telegram хранит id каналов как отрицательные числа (-100XXXXXXXXX)
-            # Telethon в peer_id даёт положительный id канала
             peer_id = getattr(event.message.peer_id, 'channel_id', None)
+            user_id = getattr(event.message.peer_id, 'user_id', None)
+            chat_id = getattr(event.message.peer_id, 'chat_id', None)
+
+            # Логируем ВСЕ входящие сообщения для отладки
+            logger.info(
+                f"[входящее] peer_id={peer_id} user_id={user_id} chat_id={chat_id} "
+                f"известные_каналы={list(self._channel_ids.keys())} "
+                f"текст={event.message.message[:50] if event.message.message else '(пусто)'!r}"
+            )
 
             if peer_id is None:
                 return
