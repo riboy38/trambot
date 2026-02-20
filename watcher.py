@@ -89,12 +89,16 @@ class ChannelWatcher:
                 }) as resp:
                     if resp.status == 200:
                         feed_text = await resp.text()
+                        logger.info(f"[{channel_key}] RSS получен с {url}")
                         break
-            except Exception:
+                    else:
+                        logger.warning(f"[{channel_key}] {url} вернул статус {resp.status}")
+            except Exception as e:
+                logger.warning(f"[{channel_key}] Ошибка {url}: {type(e).__name__}: {e}")
                 continue
 
         if not feed_text:
-            logger.warning(f"Не удалось получить RSS для {channel_key}")
+            logger.error(f"Не удалось получить RSS для {channel_key} — все источники недоступны")
             return
 
         # Парсим RSS
