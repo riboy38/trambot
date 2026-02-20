@@ -1,5 +1,6 @@
 """
 Мониторинг каналов через Telethon userbot.
+Один глобальный обработчик, список каналов обновляется динамически.
 """
 
 import asyncio
@@ -8,7 +9,7 @@ from typing import Callable, Optional
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import Message, MessageMediaPhoto
+from telethon.tl.types import MessageMediaPhoto
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,8 @@ class ChannelWatcher:
         self.get_channels = get_channels_fn
         self.on_relevant_message = on_relevant_message_fn
         self.client: Optional[TelegramClient] = None
-        self._watched_channels: set = set()
+        # id канала -> username
+        self._channel_ids: dict[int, str] = {}
 
     async def start(self):
         self.client = TelegramClient(
@@ -31,65 +33,87 @@ class ChannelWatcher:
         )
         await self.client.start()
         logger.info("Telethon userbot запущен")
-        self.client.add_event_handler(self._handle_new_message, events.NewMessage())
+
+        # Загружаем каналы из БД
         await self._refresh_channels()
+
+        # Один глобальный обработчик всех входящих сообщений
+        self.client.add_event_handler(self._handle_new_message, events.NewMessage)
+
+        logger.info(f"Слушаем {len(self._channel_ids)} каналов: {list(self._channel_ids.values())}")
+
+        # Фоновая задача для добавления новых каналов
         asyncio.create_task(self._channel_refresh_loop())
 
     async def _refresh_channels(self):
+        """Загружаем каналы из БД и резолвим их id."""
         channels = await self.get_channels()
-        new_channels = set(channels) - self._watched_channels
-        if new_channels:
-            logger.info(f"Новые каналы для мониторинга: {new_channels}")
-        self._watched_channels = set(channels)
-        logger.info(f"Отслеживаемые каналы: {self._watched_channels}")
+        known_usernames = set(self._channel_ids.values())
 
-        # Проверяем, состоит ли userbot в каждом канале
-        for channel in self._watched_channels:
+        for channel in channels:
+            if channel in known_usernames:
+                continue
             try:
                 entity = await self.client.get_entity(channel)
-                logger.info(f"✅ Канал найден и доступен: {channel} (id={entity.id})")
+                self._channel_ids[entity.id] = channel
+                logger.info(f"✅ Добавлен канал: {channel} (id={entity.id})")
             except Exception as e:
-                logger.error(f"❌ Канал недоступен: {channel} — {e}")
+                logger.error(f"❌ Не удалось добавить канал {channel}: {e}")
 
     async def _channel_refresh_loop(self):
+        """Каждые 60 секунд проверяем новые каналы в БД."""
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)
             try:
                 await self._refresh_channels()
             except Exception as e:
-                logger.error(f"Ошибка при обновлении каналов: {e}")
+                logger.error(f"Ошибка обновления каналов: {e}")
 
     async def _handle_new_message(self, event: events.NewMessage.Event):
+        """Глобальный обработчик — фильтруем по списку каналов."""
         try:
-            message: Message = event.message
-            chat = await event.get_chat()
-            channel_username = getattr(chat, "username", None)
-            if not channel_username:
+            # Получаем id чата
+            chat_id = event.chat_id
+            # Telegram хранит id каналов как отрицательные числа (-100XXXXXXXXX)
+            # Telethon в peer_id даёт положительный id канала
+            peer_id = getattr(event.message.peer_id, 'channel_id', None)
+
+            if peer_id is None:
                 return
-            channel_key = f"@{channel_username}"
-            if channel_key not in self._watched_channels:
+
+            # Проверяем, отслеживается ли этот канал
+            if peer_id not in self._channel_ids:
                 return
-            text = message.message or ""
+
+            channel_key = self._channel_ids[peer_id]
+            text = event.message.message or ""
+
+            logger.info(f"[{channel_key}] Сообщение: {text[:150]!r}")
+
             if not text:
+                logger.info(f"[{channel_key}] Пустой текст, пропускаем")
                 return
+
             keywords = await self.get_keywords()
             text_lower = text.lower()
-            # Логируем каждое сообщение из отслеживаемых каналов для отладки
-            logger.info(f"[{channel_key}] Новое сообщение: {text[:120]!r}")
             matched = [kw for kw in keywords if kw in text_lower]
+
             if not matched:
-                logger.info(f"[{channel_key}] Не найдено ключевых слов, пропускаем")
+                logger.info(f"[{channel_key}] Ключевые слова не найдены")
                 return
-            logger.info(f"[{channel_key}] Совпавшие ключевые слова: {matched}")
-            photo = message.media if isinstance(message.media, MessageMediaPhoto) else None
+
+            logger.info(f"[{channel_key}] ✅ Совпадение: {matched}")
+
+            photo = event.message.media if isinstance(event.message.media, MessageMediaPhoto) else None
+
             await self.on_relevant_message(
                 channel=channel_key,
                 text=text,
                 photo=photo,
-                telethon_message=message
+                telethon_message=event.message
             )
         except Exception as e:
-            logger.error(f"Ошибка при обработке сообщения: {e}")
+            logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
 
     async def send_message_to_user(self, user_id: int, text: str, photo=None) -> Optional[int]:
         try:
@@ -99,7 +123,7 @@ class ChannelWatcher:
                 msg = await self.client.send_message(user_id, text)
             return msg.id
         except Exception as e:
-            logger.error(f"Ошибка при отправке через userbot пользователю {user_id}: {e}")
+            logger.error(f"Ошибка отправки через userbot пользователю {user_id}: {e}")
             return None
 
     async def run_until_disconnected(self):
