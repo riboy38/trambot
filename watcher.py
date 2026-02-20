@@ -34,8 +34,17 @@ class ChannelWatcher:
         await self.client.start()
         logger.info("Telethon userbot запущен")
 
-        # Загружаем каналы из БД
+        # Загружаем каналы из БД и резолвим их
         await self._refresh_channels()
+
+        # Важно: получаем список диалогов чтобы Telethon подписался на обновления каналов
+        logger.info("Загрузка диалогов для активации получения событий...")
+        try:
+            async for dialog in self.client.iter_dialogs():
+                pass
+            logger.info("Диалоги загружены")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки диалогов: {e}")
 
         # Один глобальный обработчик всех входящих сообщений (включая каналы)
         self.client.add_event_handler(self._handle_new_message, events.NewMessage(incoming=True))
