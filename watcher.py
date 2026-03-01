@@ -1,170 +1,123 @@
 """
-Мониторинг каналов через RSS (без Telethon userbot).
-Использует публичные RSS-ленты Telegram каналов через rsshub.app
+Мониторинг каналов через Telethon userbot.
+Один глобальный обработчик, список каналов обновляется динамически.
 """
 
 import asyncio
 import logging
-import hashlib
-import xml.etree.ElementTree as ET
-from typing import Callable, Optional
-from datetime import datetime
+from typing import Optional
 
-import aiohttp
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.tl.types import MessageMediaPhoto
 
 logger = logging.getLogger(__name__)
-
-# Интервал проверки каналов в секундах
-CHECK_INTERVAL = 30
-
-# RSS источники (пробуем несколько на случай недоступности)
-RSS_TEMPLATES = [
-    "https://tgstat.ru/channel/@{channel}/rss",
-    "https://rsshub.app/telegram/channel/{channel}",
-    "https://rss.app/feeds/telegram/{channel}.xml",
-]
 
 
 class ChannelWatcher:
     def __init__(self, api_id, api_hash, session_string,
                  get_keywords_fn, get_channels_fn, on_relevant_message_fn):
-        # api_id, api_hash, session_string оставлены для совместимости, но не используются
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.session_string = session_string
         self.get_keywords = get_keywords_fn
         self.get_channels = get_channels_fn
         self.on_relevant_message = on_relevant_message_fn
-        # Храним хэши уже обработанных постов чтобы не дублировать
-        self._seen_posts: set[str] = set()
-        self._running = False
+        self.client: Optional[TelegramClient] = None
+        self._channel_ids: dict[int, str] = {}
 
     async def start(self):
-        """Запуск мониторинга."""
-        self._running = True
-        logger.info("RSS-мониторинг каналов запущен")
-        # Запускаем фоновую задачу проверки
-        asyncio.create_task(self._monitoring_loop())
+        self.client = TelegramClient(
+            StringSession(self.session_string), self.api_id, self.api_hash
+        )
+        await self.client.start()
+        logger.info("Telethon userbot запущен")
 
-    async def _monitoring_loop(self):
-        """Основной цикл проверки каналов."""
-        # Первый прогон — просто запоминаем существующие посты без рассылки
-        await self._check_all_channels(initial=True)
-        logger.info("Начальное состояние каналов загружено, начинаем мониторинг новых постов")
+        await self._refresh_channels()
 
-        while self._running:
-            await asyncio.sleep(CHECK_INTERVAL)
-            try:
-                await self._check_all_channels(initial=False)
-            except Exception as e:
-                logger.error(f"Ошибка в цикле мониторинга: {e}")
-
-    async def _check_all_channels(self, initial: bool = False):
-        """Проверить все каналы из БД."""
-        channels = await self.get_channels()
-        keywords = await self.get_keywords()
-
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as session:
-            for channel in channels:
-                # Убираем @ из имени канала
-                channel_name = channel.lstrip("@")
-                try:
-                    await self._check_channel(
-                        session, channel, channel_name, keywords, initial
-                    )
-                except Exception as e:
-                    logger.error(f"Ошибка проверки канала {channel}: {e}")
-
-    async def _check_channel(
-        self, session, channel_key: str, channel_name: str,
-        keywords: list, initial: bool
-    ):
-        """Проверить один канал через RSS."""
-        # Пробуем разные RSS источники
-        feed_text = None
-        for template in RSS_TEMPLATES:
-            url = template.format(channel=channel_name)
-            try:
-                async with session.get(url, headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; TramBot/1.0)"
-                }) as resp:
-                    if resp.status == 200:
-                        feed_text = await resp.text()
-                        logger.info(f"[{channel_key}] RSS получен с {url}")
-                        break
-                    else:
-                        logger.warning(f"[{channel_key}] {url} вернул статус {resp.status}")
-            except Exception as e:
-                logger.warning(f"[{channel_key}] Ошибка {url}: {type(e).__name__}: {e}")
-                continue
-
-        if not feed_text:
-            logger.error(f"Не удалось получить RSS для {channel_key} — все источники недоступны")
-            return
-
-        # Парсим RSS
+        # Важно: загружаем диалоги чтобы активировать получение событий из каналов
+        logger.info("Загрузка диалогов...")
         try:
-            root = ET.fromstring(feed_text)
-        except ET.ParseError as e:
-            logger.error(f"Ошибка парсинга RSS {channel_key}: {e}")
-            return
+            async for _ in self.client.iter_dialogs():
+                pass
+            logger.info("Диалоги загружены")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки диалогов: {e}")
 
-        # Ищем элементы item (RSS) или entry (Atom)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        items = root.findall(".//item") or root.findall(".//atom:entry", ns)
+        self.client.add_event_handler(
+            self._handle_new_message,
+            events.NewMessage(incoming=True)
+        )
 
-        for item in items:
-            # Получаем текст поста
-            title = item.findtext("title") or item.findtext("atom:title", namespaces=ns) or ""
-            description = item.findtext("description") or item.findtext("atom:summary", namespaces=ns) or ""
-            link = item.findtext("link") or item.findtext("atom:link", namespaces=ns) or ""
-            guid = item.findtext("guid") or link or title
+        logger.info(f"Слушаем {len(self._channel_ids)} каналов: {list(self._channel_ids.values())}")
+        asyncio.create_task(self._channel_refresh_loop())
 
-            # Уникальный хэш поста
-            post_hash = hashlib.md5(guid.encode()).hexdigest()
-
-            if initial:
-                # При старте только запоминаем, не рассылаем
-                self._seen_posts.add(post_hash)
+    async def _refresh_channels(self):
+        channels = await self.get_channels()
+        known_usernames = set(self._channel_ids.values())
+        for channel in channels:
+            if channel in known_usernames:
                 continue
+            try:
+                entity = await self.client.get_entity(channel)
+                self._channel_ids[entity.id] = channel
+                logger.info(f"✅ Добавлен канал: {channel} (id={entity.id})")
+            except Exception as e:
+                logger.error(f"❌ Канал недоступен {channel}: {e}")
 
-            if post_hash in self._seen_posts:
-                continue
+    async def _channel_refresh_loop(self):
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await self._refresh_channels()
+            except Exception as e:
+                logger.error(f"Ошибка обновления каналов: {e}")
 
-            self._seen_posts.add(post_hash)
+    async def _handle_new_message(self, event: events.NewMessage.Event):
+        try:
+            peer_id = getattr(event.message.peer_id, 'channel_id', None)
+            if peer_id is None or peer_id not in self._channel_ids:
+                return
 
-            # Полный текст = заголовок + описание
-            full_text = f"{title}\n{description}".strip()
-            # Убираем HTML теги
-            import re
-            clean_text = re.sub(r"<[^>]+>", "", full_text).strip()
+            channel_key = self._channel_ids[peer_id]
+            text = event.message.message or ""
 
-            if not clean_text:
-                continue
+            logger.info(f"[{channel_key}] Сообщение: {text[:120]!r}")
 
-            logger.info(f"[{channel_key}] Новый пост: {clean_text[:120]!r}")
+            if not text:
+                return
 
-            # Проверяем ключевые слова
-            text_lower = clean_text.lower()
+            keywords = await self.get_keywords()
+            text_lower = text.lower()
             matched = [kw for kw in keywords if kw in text_lower]
 
             if not matched:
                 logger.info(f"[{channel_key}] Ключевые слова не найдены")
-                continue
+                return
 
             logger.info(f"[{channel_key}] ✅ Совпадение: {matched}")
 
+            photo = event.message.media if isinstance(event.message.media, MessageMediaPhoto) else None
+
             await self.on_relevant_message(
                 channel=channel_key,
-                text=clean_text,
-                photo=None,
-                telethon_message=None
+                text=text,
+                photo=photo,
+                telethon_message=event.message
             )
+        except Exception as e:
+            logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
 
     async def send_message_to_user(self, user_id: int, text: str, photo=None) -> Optional[int]:
-        """Заглушка — в RSS-режиме медиа не пересылаем."""
-        return None
+        try:
+            if photo:
+                msg = await self.client.send_message(user_id, text, file=photo)
+            else:
+                msg = await self.client.send_message(user_id, text)
+            return msg.id
+        except Exception as e:
+            logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
+            return None
 
     async def run_until_disconnected(self):
-        """Держим процесс живым."""
-        while self._running:
-            await asyncio.sleep(3600)
+        await self.client.run_until_disconnected()

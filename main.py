@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TELETHON_API_ID = os.getenv("TELETHON_API_ID", "0")
-TELETHON_API_HASH = os.getenv("TELETHON_API_HASH", "")
-TELETHON_SESSION = os.getenv("TELETHON_SESSION", "")
+TELETHON_API_ID = int(os.getenv("TELETHON_API_ID", "0"))
+TELETHON_API_HASH = os.getenv("TELETHON_API_HASH")
+TELETHON_SESSION = os.getenv("TELETHON_SESSION")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -96,7 +96,7 @@ async def broadcast_relevant_message(
 
 async def main():
     """Точка входа: инициализация БД, запуск бота и userbot."""
-    if not all([BOT_TOKEN, DATABASE_URL]):
+    if not all([BOT_TOKEN, TELETHON_API_ID, TELETHON_API_HASH, TELETHON_SESSION, DATABASE_URL]):
         logger.error("Не заданы обязательные переменные окружения!")
         return
 
@@ -124,8 +124,21 @@ async def main():
         )
     )
 
-    logger.info("Запуск мониторинга каналов...")
-    await watcher.start()
+    logger.info("Запуск Telethon userbot...")
+    for attempt in range(10):
+        try:
+            await watcher.start()
+            break
+        except Exception as e:
+            if "AuthKeyDuplicated" in str(e) or "auth key" in str(e).lower():
+                wait = 10 * (attempt + 1)
+                logger.warning(f"Сессия занята, ожидаем {wait} сек (попытка {attempt + 1}/10)...")
+                await asyncio.sleep(wait)
+            else:
+                raise
+    else:
+        logger.error("Не удалось запустить userbot после 10 попыток")
+        return
 
     logger.info("Запуск aiogram бота...")
     await asyncio.gather(
