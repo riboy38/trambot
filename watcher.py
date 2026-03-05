@@ -1,123 +1,117 @@
 """
-Мониторинг каналов через Telethon userbot.
-Один глобальный обработчик, список каналов обновляется динамически.
+Мониторинг каналов через публичные веб-страницы t.me/s/канал.
+Не требует авторизации и работает без Telethon.
 """
 
 import asyncio
 import logging
+import hashlib
 from typing import Optional
 
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from telethon.tl.types import MessageMediaPhoto
+import aiohttp
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+CHECK_INTERVAL = 30
 
 
 class ChannelWatcher:
     def __init__(self, api_id, api_hash, session_string,
                  get_keywords_fn, get_channels_fn, on_relevant_message_fn):
-        self.api_id = api_id
-        self.api_hash = api_hash
-        self.session_string = session_string
         self.get_keywords = get_keywords_fn
         self.get_channels = get_channels_fn
         self.on_relevant_message = on_relevant_message_fn
-        self.client: Optional[TelegramClient] = None
-        self._channel_ids: dict[int, str] = {}
+        self._seen_posts: set[str] = set()
+        self._running = False
 
     async def start(self):
-        self.client = TelegramClient(
-            StringSession(self.session_string), self.api_id, self.api_hash
-        )
-        await self.client.start()
-        logger.info("Telethon userbot запущен")
+        self._running = True
+        logger.info("Мониторинг каналов через t.me запущен")
+        asyncio.create_task(self._monitoring_loop())
 
-        await self._refresh_channels()
+    async def _monitoring_loop(self):
+        await self._check_all_channels(initial=True)
+        logger.info("Начальное состояние загружено, начинаем мониторинг новых постов")
+        while self._running:
+            await asyncio.sleep(CHECK_INTERVAL)
+            try:
+                await self._check_all_channels(initial=False)
+            except Exception as e:
+                logger.error(f"Ошибка в цикле мониторинга: {e}")
 
-        # Важно: загружаем диалоги чтобы активировать получение событий из каналов
-        logger.info("Загрузка диалогов...")
-        try:
-            async for _ in self.client.iter_dialogs():
-                pass
-            logger.info("Диалоги загружены")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки диалогов: {e}")
-
-        self.client.add_event_handler(
-            self._handle_new_message,
-            events.NewMessage(incoming=True)
-        )
-
-        logger.info(f"Слушаем {len(self._channel_ids)} каналов: {list(self._channel_ids.values())}")
-        asyncio.create_task(self._channel_refresh_loop())
-
-    async def _refresh_channels(self):
+    async def _check_all_channels(self, initial: bool = False):
         channels = await self.get_channels()
-        known_usernames = set(self._channel_ids.values())
-        for channel in channels:
-            if channel in known_usernames:
-                continue
-            try:
-                entity = await self.client.get_entity(channel)
-                self._channel_ids[entity.id] = channel
-                logger.info(f"✅ Добавлен канал: {channel} (id={entity.id})")
-            except Exception as e:
-                logger.error(f"❌ Канал недоступен {channel}: {e}")
+        keywords = await self.get_keywords()
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+        ) as session:
+            for channel in channels:
+                try:
+                    await self._check_channel(session, channel, keywords, initial)
+                except Exception as e:
+                    logger.error(f"Ошибка проверки {channel}: {e}")
 
-    async def _channel_refresh_loop(self):
-        while True:
-            await asyncio.sleep(60)
-            try:
-                await self._refresh_channels()
-            except Exception as e:
-                logger.error(f"Ошибка обновления каналов: {e}")
+    async def _check_channel(self, session, channel_key: str, keywords: list, initial: bool):
+        channel_name = channel_key.lstrip("@")
+        url = f"https://t.me/s/{channel_name}"
 
-    async def _handle_new_message(self, event: events.NewMessage.Event):
         try:
-            peer_id = getattr(event.message.peer_id, 'channel_id', None)
-            if peer_id is None or peer_id not in self._channel_ids:
-                return
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[{channel_key}] t.me вернул статус {resp.status}")
+                    return
+                html = await resp.text()
+        except Exception as e:
+            logger.error(f"[{channel_key}] Ошибка запроса: {e}")
+            return
 
-            channel_key = self._channel_ids[peer_id]
-            text = event.message.message or ""
+        soup = BeautifulSoup(html, "html.parser")
+        messages = soup.find_all("div", class_="tgme_widget_message_text")
 
-            logger.info(f"[{channel_key}] Сообщение: {text[:120]!r}")
+        if not messages:
+            logger.debug(f"[{channel_key}] Нет сообщений на странице")
+            return
 
+        for msg in messages:
+            text = msg.get_text(separator="\n").strip()
             if not text:
-                return
+                continue
 
-            keywords = await self.get_keywords()
+            post_hash = hashlib.md5(f"{channel_key}{text[:100]}".encode()).hexdigest()
+
+            if initial:
+                self._seen_posts.add(post_hash)
+                continue
+
+            if post_hash in self._seen_posts:
+                continue
+
+            self._seen_posts.add(post_hash)
+            logger.info(f"[{channel_key}] Новый пост: {text[:120]!r}")
+
             text_lower = text.lower()
             matched = [kw for kw in keywords if kw in text_lower]
 
             if not matched:
                 logger.info(f"[{channel_key}] Ключевые слова не найдены")
-                return
+                continue
 
             logger.info(f"[{channel_key}] ✅ Совпадение: {matched}")
-
-            photo = event.message.media if isinstance(event.message.media, MessageMediaPhoto) else None
 
             await self.on_relevant_message(
                 channel=channel_key,
                 text=text,
-                photo=photo,
-                telethon_message=event.message
+                photo=None,
+                telethon_message=None
             )
-        except Exception as e:
-            logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
 
     async def send_message_to_user(self, user_id: int, text: str, photo=None) -> Optional[int]:
-        try:
-            if photo:
-                msg = await self.client.send_message(user_id, text, file=photo)
-            else:
-                msg = await self.client.send_message(user_id, text)
-            return msg.id
-        except Exception as e:
-            logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
-            return None
+        return None
 
     async def run_until_disconnected(self):
-        await self.client.run_until_disconnected()
+        while self._running:
+            await asyncio.sleep(3600)
