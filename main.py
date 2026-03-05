@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELETHON_API_ID = 0
 TELETHON_API_HASH = ""
-TELETHON_SESSION = 
+TELETHON_SESSION = ""
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
