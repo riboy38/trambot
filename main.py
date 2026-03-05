@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TELETHON_API_ID = int(os.getenv("TELETHON_API_ID", "0"))
-TELETHON_API_HASH = os.getenv("TELETHON_API_HASH")
-TELETHON_SESSION = os.getenv("TELETHON_SESSION")
+TELETHON_API_ID = 0
+TELETHON_API_HASH = ""
+TELETHON_SESSION = 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -96,7 +96,7 @@ async def broadcast_relevant_message(
 
 async def main():
     """Точка входа: инициализация БД, запуск бота и userbot."""
-    if not all([BOT_TOKEN, TELETHON_API_ID, TELETHON_API_HASH, TELETHON_SESSION, DATABASE_URL]):
+    if not all([BOT_TOKEN, DATABASE_URL]):
         logger.error("Не заданы обязательные переменные окружения!")
         return
 
