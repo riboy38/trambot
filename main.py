@@ -45,6 +45,7 @@ async def broadcast_relevant_message(
     channel: str,
     text: str,
     photo=None,
+    photo_url: str = None,
     telethon_message=None,
     watcher: ChannelWatcher = None
 ):
@@ -61,30 +62,26 @@ async def broadcast_relevant_message(
 
     for user_id in subscribers:
         try:
-            if photo and watcher:
-                msg_id = await watcher.send_message_to_user(
-                    user_id, notification_text, photo=photo
+            if photo_url or (photo and isinstance(photo, str) and photo.startswith("http")):
+                url = photo_url or photo
+                msg = await bot.send_photo(
+                    user_id,
+                    photo=url,
+                    caption=notification_text,
+                    parse_mode=ParseMode.HTML
                 )
-                if msg_id:
-                    await db.save_notification(
-                        user_id=user_id,
-                        message_id=msg_id,
-                        text=notification_text,
-                        source_channel=channel,
-                        photo_file_id="telethon"
-                    )
             else:
                 msg = await bot.send_message(
                     user_id,
                     text=notification_text,
                     parse_mode=ParseMode.HTML
                 )
-                await db.save_notification(
-                    user_id=user_id,
-                    message_id=msg.message_id,
-                    text=notification_text,
-                    source_channel=channel
-                )
+            await db.save_notification(
+                user_id=user_id,
+                message_id=msg.message_id,
+                text=notification_text,
+                source_channel=channel
+            )
         except Exception as e:
             err_str = str(e).lower()
             if "blocked" in err_str or "user is deactivated" in err_str or "bot was blocked" in err_str:

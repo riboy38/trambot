@@ -90,7 +90,7 @@ class ChannelWatcher:
                 if post_id in self._seen_posts:
                     continue
                 self._seen_posts.add(post_id)
-                await self._process_post(channel_key, post_id, text, keywords)
+                await self._process_post(channel_key, post_id, text, keywords, None)
             return
 
         for msg_div in messages:
@@ -112,13 +112,51 @@ class ChannelWatcher:
             text_div = msg_div.find("div", class_="tgme_widget_message_text")
             text = text_div.get_text(separator="\n").strip() if text_div else ""
 
-            if not text:
+            # Получаем URL фото если есть
+            photo_url = None
+            photo_wrap = msg_div.find("a", class_="tgme_widget_message_photo_wrap")
+            if photo_wrap:
+                style = photo_wrap.get("style", "")
+                import re
+                match = re.search(r"url\('(.*?)'\)", style)
+                if match:
+                    photo_url = match.group(1)
+
+            if not text and not photo_url:
                 continue
 
-            await self._process_post(channel_key, post_id, text, keywords)
+            await self._process_post(channel_key, post_id, text, keywords, photo_url)
 
-    async def _process_post(self, channel_key: str, post_id: str, text: str, keywords: list):
-        logger.info(f"[{channel_key}] Новый пост [{post_id}]: {text[:120]!r}")
+    def _clean_text(self, text: str) -> str:
+        """Убирает подписи и рекламные блоки каналов."""
+        import re
+        stop_phrases = [
+            "подписаться", "написать нам", "прислать новость",
+            "подписывайтесь", "наш канал", "один клик",
+            "не забывайте ставить", "пожалуйста, паркуйтесь",
+            "если у вас плохо грузятся", "посты дублируются",
+            "мы в max", "вконтакте", "почта admin",
+            "подпишись на канал", "предложить новость",
+            "фото:", "видео:", "источник:",
+        ]
+        lines = text.split("\n")
+        clean_lines = []
+        for line in lines:
+            line_lower = line.lower().strip()
+            if any(phrase in line_lower for phrase in stop_phrases):
+                break
+            if re.search(r"https?://|t\.me/|max\.ru/", line_lower):
+                continue
+            if line.strip():
+                clean_lines.append(line.strip())
+        return "\n".join(clean_lines).strip()
+
+    async def _process_post(self, channel_key: str, post_id: str, text: str, keywords: list, photo_url: str = None):
+        text = self._clean_text(text) if text else ""
+        if not text and not photo_url:
+            return
+
+        logger.info(f"[{channel_key}] Новый пост [{post_id}]: {text[:120]!r} фото={photo_url is not None}")
 
         text_lower = text.lower()
         matched = [kw for kw in keywords if kw in text_lower]
@@ -132,10 +170,9 @@ class ChannelWatcher:
         await self.on_relevant_message(
             channel=channel_key,
             text=text,
-            photo=None,
+            photo=photo_url,
             telethon_message=None
         )
-
     async def send_message_to_user(self, user_id: int, text: str, photo=None) -> Optional[int]:
         return None
 
