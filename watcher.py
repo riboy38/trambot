@@ -46,7 +46,9 @@ class ChannelWatcher:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=15),
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
             }
         ) as session:
             for channel in channels:
@@ -70,44 +72,69 @@ class ChannelWatcher:
             return
 
         soup = BeautifulSoup(html, "html.parser")
-        messages = soup.find_all("div", class_="tgme_widget_message_text")
+
+        # Ищем все сообщения с их ID
+        messages = soup.find_all("div", class_=lambda c: c and "tgme_widget_message " in c)
 
         if not messages:
-            logger.debug(f"[{channel_key}] Нет сообщений на странице")
+            # Запасной вариант — ищем просто по тексту
+            messages = soup.find_all("div", class_="tgme_widget_message_text")
+            for msg in messages:
+                text = msg.get_text(separator="\n").strip()
+                if not text:
+                    continue
+                post_id = hashlib.md5(f"{channel_key}{text[:50]}".encode()).hexdigest()
+                if initial:
+                    self._seen_posts.add(post_id)
+                    continue
+                if post_id in self._seen_posts:
+                    continue
+                self._seen_posts.add(post_id)
+                await self._process_post(channel_key, post_id, text, keywords)
             return
 
-        for msg in messages:
-            text = msg.get_text(separator="\n").strip()
+        for msg_div in messages:
+            # Получаем ID поста из атрибута data-post
+            data_post = msg_div.get("data-post", "")
+            post_id = data_post if data_post else hashlib.md5(
+                f"{channel_key}{msg_div.get_text()[:50]}".encode()
+            ).hexdigest()
+
+            if initial:
+                self._seen_posts.add(post_id)
+                continue
+
+            if post_id in self._seen_posts:
+                continue
+
+            self._seen_posts.add(post_id)
+
+            text_div = msg_div.find("div", class_="tgme_widget_message_text")
+            text = text_div.get_text(separator="\n").strip() if text_div else ""
+
             if not text:
                 continue
 
-            post_hash = hashlib.md5(f"{channel_key}{text[:100]}".encode()).hexdigest()
+            await self._process_post(channel_key, post_id, text, keywords)
 
-            if initial:
-                self._seen_posts.add(post_hash)
-                continue
+    async def _process_post(self, channel_key: str, post_id: str, text: str, keywords: list):
+        logger.info(f"[{channel_key}] Новый пост [{post_id}]: {text[:120]!r}")
 
-            if post_hash in self._seen_posts:
-                continue
+        text_lower = text.lower()
+        matched = [kw for kw in keywords if kw in text_lower]
 
-            self._seen_posts.add(post_hash)
-            logger.info(f"[{channel_key}] Новый пост: {text[:120]!r}")
+        if not matched:
+            logger.info(f"[{channel_key}] Ключевые слова не найдены")
+            return
 
-            text_lower = text.lower()
-            matched = [kw for kw in keywords if kw in text_lower]
+        logger.info(f"[{channel_key}] ✅ Совпадение: {matched}")
 
-            if not matched:
-                logger.info(f"[{channel_key}] Ключевые слова не найдены")
-                continue
-
-            logger.info(f"[{channel_key}] ✅ Совпадение: {matched}")
-
-            await self.on_relevant_message(
-                channel=channel_key,
-                text=text,
-                photo=None,
-                telethon_message=None
-            )
+        await self.on_relevant_message(
+            channel=channel_key,
+            text=text,
+            photo=None,
+            telethon_message=None
+        )
 
     async def send_message_to_user(self, user_id: int, text: str, photo=None) -> Optional[int]:
         return None

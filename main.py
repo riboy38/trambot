@@ -140,6 +140,14 @@ async def main():
         logger.error("Не удалось запустить userbot после 10 попыток")
         return
 
+    # Устанавливаем команды бота в меню Telegram
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Подписаться на уведомления"),
+        BotCommand(command="stop", description="Отписаться от уведомлений"),
+        BotCommand(command="suggest", description="Предложить сообщение для публикации"),
+    ])
+    logger.info("Команды бота установлены")
     logger.info("Запуск aiogram бота...")
     await asyncio.gather(
         dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()),
