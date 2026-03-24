@@ -100,6 +100,7 @@ async def main():
     logger.info("Подключение к базе данных...")
     await db.init_db(DATABASE_URL)
     await db.fix_channel_urls()  # Исправляем каналы, добавленные как полные ссылки
+    await db.init_seen_posts_table()  # Таблица для дедупликации постов
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())

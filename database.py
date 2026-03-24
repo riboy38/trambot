@@ -335,3 +335,37 @@ async def fix_channel_urls():
                     clean, row["id"]
                 )
                 logger.info(f"Исправлен канал: {channel!r} → {clean!r}")
+
+
+async def init_seen_posts_table():
+    """Создаём таблицу для хранения уже обработанных постов."""
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS seen_posts (
+                post_id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                seen_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        # Удаляем записи старше 7 дней чтобы таблица не разрасталась
+        await conn.execute("""
+            DELETE FROM seen_posts WHERE seen_at < NOW() - INTERVAL '7 days'
+        """)
+
+
+async def is_post_seen(post_id: str) -> bool:
+    """Проверить был ли пост уже обработан."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM seen_posts WHERE post_id = $1", post_id
+        )
+        return row is not None
+
+
+async def mark_post_seen(post_id: str, channel: str):
+    """Отметить пост как обработанный."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO seen_posts (post_id, channel) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            post_id, channel
+        )

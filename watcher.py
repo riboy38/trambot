@@ -10,6 +10,7 @@ from typing import Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
+import database as db
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class ChannelWatcher:
         self.get_keywords = get_keywords_fn
         self.get_channels = get_channels_fn
         self.on_relevant_message = on_relevant_message_fn
-        self._seen_posts: set[str] = set()
+        # seen_posts теперь хранится в БД
         self._running = False
 
     async def start(self):
@@ -94,20 +95,27 @@ class ChannelWatcher:
             return
 
         for msg_div in messages:
-            # Получаем ID поста из атрибута data-post
-            data_post = msg_div.get("data-post", "")
-            post_id = data_post if data_post else hashlib.md5(
-                f"{channel_key}{msg_div.get_text()[:50]}".encode()
-            ).hexdigest()
+            # data-post может быть на самом div или на его родителе
+            data_post = (
+                msg_div.get("data-post") or
+                (msg_div.parent.get("data-post") if msg_div.parent else None) or
+                ""
+            )
+            if data_post:
+                post_id = data_post
+            else:
+                # Нормализуем текст — убираем лишние пробелы для стабильного хэша
+                raw_text = " ".join(msg_div.get_text().split())[:80]
+                post_id = hashlib.md5(f"{channel_key}{raw_text}".encode()).hexdigest()
 
             if initial:
-                self._seen_posts.add(post_id)
+                await db.mark_post_seen(post_id, channel_key)
                 continue
 
-            if post_id in self._seen_posts:
+            if await db.is_post_seen(post_id):
                 continue
 
-            self._seen_posts.add(post_id)
+            await db.mark_post_seen(post_id, channel_key)
 
             text_div = msg_div.find("div", class_="tgme_widget_message_text")
             text = text_div.get_text(separator="\n").strip() if text_div else ""
@@ -138,6 +146,11 @@ class ChannelWatcher:
             "мы в max", "вконтакте", "почта admin",
             "подпишись на канал", "предложить новость",
             "фото:", "видео:", "источник:",
+            "если вы стали свидетелем",
+            "присылайте в наш бот",
+            "проголосовать за канал",
+            "наш вконтакте",
+            "тула. происшествия",
         ]
         lines = text.split("\n")
         clean_lines = []
