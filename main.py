@@ -62,20 +62,11 @@ async def broadcast_relevant_message(
 
     for user_id in subscribers:
         try:
-            if photo_url or (photo and isinstance(photo, str) and photo.startswith("http")):
-                url = photo_url or photo
-                msg = await bot.send_photo(
-                    user_id,
-                    photo=url,
-                    caption=notification_text,
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                msg = await bot.send_message(
-                    user_id,
-                    text=notification_text,
-                    parse_mode=ParseMode.HTML
-                )
+            msg = await bot.send_message(
+                user_id,
+                text=notification_text,
+                parse_mode=ParseMode.HTML
+            )
             await db.save_notification(
                 user_id=user_id,
                 message_id=msg.message_id,
