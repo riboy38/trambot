@@ -62,6 +62,7 @@ WELCOME_TEXT = """
 <b>Команды:</b>
 /start — подписаться на уведомления
 /stop — отписаться от уведомлений
+/routes — актуальные маршруты и ремонты 🚧
 /suggest — предложить своё сообщение для публикации
 
 Вы успешно подписались на уведомления! ✅
@@ -74,6 +75,7 @@ ALREADY_SUBSCRIBED_TEXT = """
 
 <b>Команды:</b>
 /stop — отписаться
+/routes — актуальные маршруты и ремонты 🚧
 /suggest — предложить сообщение для публикации
 """
 
@@ -182,3 +184,93 @@ async def _notify_admin_about_suggestion(bot: Bot, admin_id: int, post_id: int, 
             await bot.send_message(admin_id, text=caption, parse_mode="HTML", reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Ошибка при уведомлении администратора: {e}")
+
+
+# ─── Меню маршрутов для пользователей ────────────────────────────────────────
+
+async def build_user_routes_keyboard() -> InlineKeyboardMarkup:
+    routes = await db.get_all_routes()
+    buttons = []
+    row = []
+    for r in routes:
+        row.append(InlineKeyboardButton(text=f"Трамвай {r['route_number']}", callback_data=f"user:route_info:{r['route_number']}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("routes"))
+async def cmd_user_routes(message: Message, bot: Bot):
+    if not await check_channel_subscription(bot, message.from_user.id):
+        await send_subscribe_prompt(message)
+        return
+    
+    keyboard = await build_user_routes_keyboard()
+    if not keyboard.inline_keyboard:
+        await message.answer("🚧 На данный момент информация об измененных маршрутах пуста.")
+        return
+
+    await message.answer(
+        "🚧 <b>Изменения трамвайных маршрутов Тулы</b>\n\n"
+        "Выберите интересующий вас номер трамвая ниже, чтобы узнать его актуальный путь следования:",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("user:route_info:"))
+async def user_route_info_callback(callback, bot: Bot):
+    route_num = callback.data.split(":")[2]
+    route_data = await db.get_route(route_num)
+    
+    if not route_data:
+        await callback.answer("Информация об этом маршруте уже не актуальна.", show_alert=True)
+        return
+
+    caption = f"🚃 <b>Маршрут № {route_data['route_number']}</b>\n\n{route_data['description']}"
+    
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀️ Назад к маршрутам", callback_data="user:routes:back")
+    ]])
+
+    if route_data['photo_file_id']:
+        await bot.send_photo(
+            chat_id=callback.from_user.id,
+            photo=route_data['photo_file_id'],
+            caption=caption,
+            reply_markup=back_kb,
+            parse_mode="HTML"
+        )
+    else:
+        await bot.send_message(
+            chat_id=callback.from_user.id,
+            text=caption,
+            reply_markup=back_kb,
+            parse_mode="HTML"
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "user:routes:back")
+async def user_routes_back(callback, bot: Bot):
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+        
+    keyboard = await build_user_routes_keyboard()
+    await bot.send_message(
+        chat_id=callback.from_user.id,
+        text="🚧 <b>Изменения трамвайных маршрутов Тулы</b>\n\nВыберите номер трамвая:",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()

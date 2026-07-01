@@ -60,6 +60,12 @@ async def create_tables():
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS tram_routes (
+                route_number TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                photo_file_id TEXT
+            );
         """)
     logger.info("Таблицы созданы/проверены")
 
@@ -369,3 +375,42 @@ async def mark_post_seen(post_id: str, channel: str):
             "INSERT INTO seen_posts (post_id, channel) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             post_id, channel
         )
+
+
+# ─── Управление маршрутами ───────────────────────────────────────────────────
+
+async def get_all_routes() -> list[dict]:
+    """Получить список всех сохраненных маршрутов."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT route_number, description, photo_file_id FROM tram_routes ORDER BY route_number")
+        return [dict(r) for r in rows]
+
+
+async def get_route(route_number: str) -> Optional[dict]:
+    """Получить информацию о конкретном маршруте."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT route_number, description, photo_file_id FROM tram_routes WHERE route_number = $1",
+            route_number
+        )
+        return dict(row) if row else None
+
+
+async def add_or_update_route(route_number: str, description: str, photo_file_id: str = None) -> bool:
+    """Добавить новый или обновить существующий маршрут."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO tram_routes (route_number, description, photo_file_id) 
+               VALUES ($1, $2, $3)
+               ON CONFLICT (route_number) 
+               DO UPDATE SET description = EXCLUDED.description, photo_file_id = EXCLUDED.photo_file_id""",
+            route_number, description, photo_file_id
+        )
+        return True
+
+
+async def remove_route(route_number: str) -> bool:
+    """Удалить маршрут по его номеру."""
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM tram_routes WHERE route_number = $1", route_number)
+        return result == "DELETE 1"

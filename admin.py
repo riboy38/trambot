@@ -27,6 +27,8 @@ class AdminStates(StatesGroup):
     adding_keyword = State()
     removing_keyword = State()
     creating_broadcast = State()
+    waiting_for_route_data = State()
+    waiting_for_route_delete = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -38,6 +40,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📡 Каналы", callback_data="admin:channels"),
             InlineKeyboardButton(text="🔑 Ключевые слова", callback_data="admin:keywords"),
+        ],
+        [
+            InlineKeyboardButton(text="🚃 Маршруты трамваев", callback_data="admin:routes")
         ],
         [InlineKeyboardButton(text="📢 Создать уведомление", callback_data="admin:broadcast")],
         [InlineKeyboardButton(text="📋 История уведомлений", callback_data="admin:history:0")],
@@ -196,6 +201,60 @@ async def keywords_remove_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ─── Управление маршрутами ───────────────────────────────────────────────────
+
+def routes_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Добавить/Обновить", callback_data="admin:routes:add"),
+            InlineKeyboardButton(text="➖ Удалить", callback_data="admin:routes:remove"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:main")],
+    ])
+
+
+@router.callback_query(F.data == "admin:routes")
+async def admin_routes_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await callback.message.edit_text(
+        "🚃 <b>Управление маршрутами</b>\n\n"
+        "Здесь вы можете актуализировать информацию о трамваях города.",
+        reply_markup=routes_admin_keyboard(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:routes:add")
+async def admin_add_route_prompt(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_route_data)
+    await callback.message.edit_text(
+        "📝 <b>Добавление/Обновление маршрута</b>\n\n"
+        "Отправьте сообщение в формате:\n"
+        "<code>[Номер маршрута] - [Описание изменений или пути]</code>\n\n"
+        "<i>Пример: 3 - Изменен из-за ремонта на ул. Коминтерна. Ходит до Московского вокзала.</i>\n\n"
+        "<b>К сообщению можно прикрепить изображение/карту схемы движения!</b>\n\n"
+        "Для отмены: /cancel",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:routes:remove")
+async def admin_remove_route_prompt(callback: CallbackQuery, state: FSMContext):
+    routes = await db.get_all_routes()
+    if not routes:
+        await callback.answer("Список маршрутов пуст.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_route_delete)
+    routes_list = "\n".join(f"• Маршрут <b>{r['route_number']}</b>" for r in routes)
+    await callback.message.edit_text(
+        f"Введите только <b>номер маршрута</b>, который нужно удалить:\n\n{routes_list}\n\nДля отмены: /cancel",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
 # ─── Рассылка ─────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "admin:broadcast")
@@ -349,6 +408,51 @@ async def process_remove_keyword(message: Message, state: FSMContext):
         f"✅ Слово «{word}» удалено." if removed else f"⚠️ Слово «{word}» не найдено.",
         reply_markup=main_menu_keyboard()
     )
+    await state.clear()
+
+
+@router.message(AdminStates.waiting_for_route_data)
+async def process_admin_add_route(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    text = message.text or message.caption or ""
+    if text.startswith("/"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=main_menu_keyboard())
+        return
+
+    if " - " not in text:
+        await message.answer("⚠️ Неверный формат. Используйте дефис как разделитель.\nПример: <code>9 - Описание</code>")
+        return
+
+    route_number, description = text.split(" - ", 1)
+    route_number = route_number.strip()
+    description = description.strip()
+    
+    photo_file_id = message.photo[-1].file_id if message.photo else None
+
+    await db.add_or_update_route(route_number, description, photo_file_id)
+    await message.answer(f"✅ Маршрут <b>{route_number}</b> успешно обновлен в базе!", reply_markup=main_menu_keyboard(), parse_mode="HTML")
+    await state.clear()
+
+
+@router.message(AdminStates.waiting_for_route_delete)
+async def process_admin_remove_route(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    route_num = message.text.strip()
+    if route_num.startswith("/"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=main_menu_keyboard())
+        return
+
+    removed = await db.remove_route(route_num)
+    if removed:
+        await message.answer(f"✅ Маршрут <b>{route_num}</b> успешно удален.", reply_markup=main_menu_keyboard(), parse_mode="HTML")
+    else:
+        await message.answer(f"⚠️ Маршрут <b>{route_num}</b> не найден в базе данных.", reply_markup=main_menu_keyboard(), parse_mode="HTML")
     await state.clear()
 
 
