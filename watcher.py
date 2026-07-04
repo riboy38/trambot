@@ -1,6 +1,6 @@
 """
 Мониторинг каналов через публичные веб-страницы t.me/s/канал.
-Защищен от бесконечных зависаний сети (Infinity Timeout).
+Защищен от бесконечных зависаний сети (Infinity Timeout) и ошибок структуры БД.
 """
 
 import asyncio
@@ -54,13 +54,24 @@ class ChannelWatcher:
 
         keywords_lower = [kw.lower().strip() for kw in keywords if kw.strip()]
 
-        # Устанавливаем жесткие лимиты на подключение (10 сек на коннект, 15 сек на чтение), 
-        # чтобы запросы гарантированно не зависали навсегда при сетевых сбоях
+        # Жесткие лимиты на подключение (10 сек на коннект, 15 сек на чтение), чтобы запросы не зависали
         timeout_config = aiohttp.ClientTimeout(total=25, connect=10, sock_read=15)
 
         async with aiohttp.ClientSession(timeout=timeout_config) as session:
             for ch in channels:
-                channel_key = ch["channel"]
+                # ИСПРАВЛЕНО: Универсальное извлечение названия канала независимо от структуры данных из БД
+                if isinstance(ch, str):
+                    channel_key = ch
+                elif isinstance(ch, dict) and "channel" in ch:
+                    channel_key = ch["channel"]
+                elif hasattr(ch, "keys") and "channel" in ch.keys():  # Для asyncpg Record
+                    channel_key = ch["channel"]
+                elif isinstance(ch, (list, tuple)) and len(ch) > 0:
+                    channel_key = ch[0]
+                else:
+                    channel_key = str(ch)
+
+                channel_key = channel_key.strip()
                 username = channel_key.replace("@", "").strip()
                 url = f"https://t.me/s/{username}"
 
@@ -83,8 +94,7 @@ class ChannelWatcher:
                 if not post_elements:
                     continue
 
-                # При первом запуске берем последние 3 поста и полноценно проверяем их на ключи,
-                # чтобы не пропускать важного из-за перезапуска бота
+                # При первом запуске берем последние 3 поста, чтобы проверить их на ключи
                 elements_to_check = post_elements[-3:] if initial else post_elements
 
                 for elem in elements_to_check:
@@ -98,7 +108,6 @@ class ChannelWatcher:
                         continue
 
                     text_elem = elem.find("div", class_="tgme_widget_message_text")
-                    # Соединяем через пробел, чтобы внутренние теги Telegram не рвали слова
                     text = text_elem.get_text(separator=" ") if text_elem else ""
 
                     photo_url = None
@@ -118,7 +127,7 @@ class ChannelWatcher:
             "тула. происшествия", "тг-канал"
         ]
         
-        # Удаляем ссылки из текста, не ломая строки целиком
+        # Удаляем ссылки из текста
         text = re.sub(r"https?://\S+", "", text)
         text = re.sub(r"t\.me/\S+", "", text)
         text = re.sub(r"max\.ru/\S+", "", text)
@@ -142,7 +151,6 @@ class ChannelWatcher:
         if not cleaned_text and not photo_url:
             return
 
-        # Убираем все разрывы строк исключительно ради точного поиска совпадений
         text_for_search = re.sub(r"\s+", " ", cleaned_text.lower()).strip()
         matched = [kw for kw in keywords if kw in text_for_search]
 
