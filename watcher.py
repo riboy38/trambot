@@ -1,11 +1,11 @@
 """
 Мониторинг каналов через публичные веб-страницы t.me/s/канал.
-Не требует авторизации и работает без Telethon.
+Защищен от бесконечных зависаний сети (Infinity Timeout).
 """
 
 import asyncio
 import logging
-import hashlib
+import re
 from typing import Optional
 
 import aiohttp
@@ -14,7 +14,7 @@ import database as db
 
 logger = logging.getLogger(__name__)
 
-CHECK_INTERVAL = 30
+CHECK_INTERVAL = 45  # Интервал проверки каналов в секундах
 
 
 class ChannelWatcher:
@@ -23,7 +23,6 @@ class ChannelWatcher:
         self.get_keywords = get_keywords_fn
         self.get_channels = get_channels_fn
         self.on_relevant_message = on_relevant_message_fn
-        # seen_posts теперь хранится в БД
         self._running = False
 
     async def start(self):
@@ -32,163 +31,137 @@ class ChannelWatcher:
         asyncio.create_task(self._monitoring_loop())
 
     async def _monitoring_loop(self):
-        await self._check_all_channels(initial=True)
-        logger.info("Начальное состояние загружено, начинаем мониторинг новых постов")
+        try:
+            await self._check_all_channels(initial=True)
+        except Exception as e:
+            logger.error(f"Ошибка при начальной инициализации каналов: {e}", exc_info=True)
+
+        logger.info("Начальное состояние обработано, запуск постоянного цикла мониторинга...")
+        
         while self._running:
             await asyncio.sleep(CHECK_INTERVAL)
             try:
                 await self._check_all_channels(initial=False)
             except Exception as e:
-                logger.error(f"Ошибка в цикле мониторинга: {e}")
+                logger.error(f"Критическая ошибка в итерации цикла мониторинга: {e}", exc_info=True)
 
     async def _check_all_channels(self, initial: bool = False):
         channels = await self.get_channels()
         keywords = await self.get_keywords()
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15),
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            }
-        ) as session:
-            for channel in channels:
+
+        if not channels or not keywords:
+            return
+
+        keywords_lower = [kw.lower().strip() for kw in keywords if kw.strip()]
+
+        # Устанавливаем жесткие лимиты на подключение (10 сек на коннект, 15 сек на чтение), 
+        # чтобы запросы гарантированно не зависали навсегда при сетевых сбоях
+        timeout_config = aiohttp.ClientTimeout(total=25, connect=10, sock_read=15)
+
+        async with aiohttp.ClientSession(timeout=timeout_config) as session:
+            for ch in channels:
+                channel_key = ch["channel"]
+                username = channel_key.replace("@", "").strip()
+                url = f"https://t.me/s/{username}"
+
                 try:
-                    await self._check_channel(session, channel, keywords, initial)
+                    async with session.get(url) as response:
+                        if response.status != 200:
+                            logger.error(f"[{channel_key}] Ошибка парсинга: HTTP Status {response.status}")
+                            continue
+                        html = await response.text()
+                except asyncio.TimeoutError:
+                    logger.error(f"[{channel_key}] Превышено время ожидания ответа (Таймаут сети)")
+                    continue
                 except Exception as e:
-                    logger.error(f"Ошибка проверки {channel}: {e}")
-
-    async def _check_channel(self, session, channel_key: str, keywords: list, initial: bool):
-        channel_name = channel_key.lstrip("@")
-        url = f"https://t.me/s/{channel_name}"
-
-        try:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    logger.warning(f"[{channel_key}] t.me вернул статус {resp.status}")
-                    return
-                html = await resp.text()
-        except Exception as e:
-            logger.error(f"[{channel_key}] Ошибка запроса: {e}")
-            return
-
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Ищем все сообщения с их ID
-        messages = soup.find_all("div", class_=lambda c: c and "tgme_widget_message " in c)
-
-        if not messages:
-            # Запасной вариант — ищем просто по тексту
-            messages = soup.find_all("div", class_="tgme_widget_message_text")
-            for msg in messages:
-                text = msg.get_text(separator="\n").strip()
-                if not text:
+                    logger.error(f"[{channel_key}] Ошибка запроса сети: {e}")
                     continue
-                post_id = hashlib.md5(f"{channel_key}{text[:50]}".encode()).hexdigest()
-                if initial:
-                    self._seen_posts.add(post_id)
+
+                soup = BeautifulSoup(html, "html.parser")
+                post_elements = soup.find_all("div", class_="tgme_widget_message_wrap")
+
+                if not post_elements:
                     continue
-                if post_id in self._seen_posts:
-                    continue
-                self._seen_posts.add(post_id)
-                await self._process_post(channel_key, post_id, text, keywords, None)
-            return
 
-        for msg_div in messages:
-            # data-post может быть на самом div или на его родителе
-            data_post = (
-                msg_div.get("data-post") or
-                (msg_div.parent.get("data-post") if msg_div.parent else None) or
-                ""
-            )
-            if data_post:
-                post_id = data_post
-            else:
-                # Нормализуем текст — убираем лишние пробелы для стабильного хэша
-                raw_text = " ".join(msg_div.get_text().split())[:80]
-                post_id = hashlib.md5(f"{channel_key}{raw_text}".encode()).hexdigest()
+                # При первом запуске берем последние 3 поста и полноценно проверяем их на ключи,
+                # чтобы не пропускать важного из-за перезапуска бота
+                elements_to_check = post_elements[-3:] if initial else post_elements
 
-            if initial:
-                await db.mark_post_seen(post_id, channel_key)
-                continue
+                for elem in elements_to_check:
+                    msg_elem = elem.find("div", class_="tgme_widget_message")
+                    if not msg_elem or not msg_elem.has_attr("data-post"):
+                        continue
 
-            if await db.is_post_seen(post_id):
-                continue
+                    post_id = msg_elem["data-post"]
 
-            await db.mark_post_seen(post_id, channel_key)
+                    if await db.is_post_seen(post_id):
+                        continue
 
-            text_div = msg_div.find("div", class_="tgme_widget_message_text")
-            text = text_div.get_text(separator="\n").strip() if text_div else ""
+                    text_elem = elem.find("div", class_="tgme_widget_message_text")
+                    # Соединяем через пробел, чтобы внутренние теги Telegram не рвали слова
+                    text = text_elem.get_text(separator=" ") if text_elem else ""
 
-            # Получаем URL фото если есть
-            photo_url = None
-            photo_wrap = msg_div.find("a", class_="tgme_widget_message_photo_wrap")
-            if photo_wrap:
-                style = photo_wrap.get("style", "")
-                import re
-                match = re.search(r"url\('(.*?)'\)", style)
-                if match:
-                    photo_url = match.group(1)
+                    photo_url = None
+                    photo_elem = elem.find("a", class_="tgme_widget_message_photo_wrap")
+                    if photo_elem and photo_elem.has_attr("style"):
+                        style = photo_elem["style"]
+                        match = re.search(r"background-image:url\(['\"](.*?)['\"]\)", style)
+                        if match:
+                            photo_url = match.group(1)
 
-            if not text and not photo_url:
-                continue
-
-            await self._process_post(channel_key, post_id, text, keywords, photo_url)
+                    await self._process_post(channel_key, post_id, text, keywords_lower, photo_url)
+                    await db.mark_post_seen(post_id, channel_key)
 
     def _clean_text(self, text: str) -> str:
-        """Убирает подписи и рекламные блоки каналов."""
-        import re
         stop_phrases = [
-            "подписаться", "написать нам", "прислать новость",
-            "подписывайтесь", "наш канал", "один клик",
-            "не забывайте ставить", "пожалуйста, паркуйтесь",
-            "если у вас плохо грузятся", "посты дублируются",
-            "мы в max", "вконтакте", "почта admin",
-            "подпишись на канал", "предложить новость",
-            "фото:", "видео:", "источник:",
-            "если вы стали свидетелем",
-            "присылайте в наш бот",
-            "проголосовать за канал",
-            "наш вконтакте",
-            "тула. происшествия",
+            "подписаться", "наш канал", "прислать новость",
+            "тула. происшествия", "тг-канал"
         ]
+        
+        # Удаляем ссылки из текста, не ломая строки целиком
+        text = re.sub(r"https?://\S+", "", text)
+        text = re.sub(r"t\.me/\S+", "", text)
+        text = re.sub(r"max\.ru/\S+", "", text)
+
         lines = text.split("\n")
         clean_lines = []
         for line in lines:
             line_lower = line.lower().strip()
+            
             if any(phrase in line_lower for phrase in stop_phrases):
-                break
-            if re.search(r"https?://|t\.me/|max\.ru/", line_lower):
                 continue
-            if line.strip():
-                clean_lines.append(line.strip())
+            
+            line = re.sub(r"\s+", " ", line).strip()
+            if line:
+                clean_lines.append(line)
+                
         return "\n".join(clean_lines).strip()
 
     async def _process_post(self, channel_key: str, post_id: str, text: str, keywords: list, photo_url: str = None):
-        text = self._clean_text(text) if text else ""
-        if not text and not photo_url:
+        cleaned_text = self._clean_text(text) if text else ""
+        if not cleaned_text and not photo_url:
             return
 
-        logger.info(f"[{channel_key}] Новый пост [{post_id}]: {text[:120]!r} фото={photo_url is not None}")
-
-        text_lower = text.lower()
-        matched = [kw for kw in keywords if kw in text_lower]
+        # Убираем все разрывы строк исключительно ради точного поиска совпадений
+        text_for_search = re.sub(r"\s+", " ", cleaned_text.lower()).strip()
+        matched = [kw for kw in keywords if kw in text_for_search]
 
         if not matched:
-            logger.info(f"[{channel_key}] Ключевые слова не найдены")
             return
 
-        logger.info(f"[{channel_key}] ✅ Совпадение: {matched}")
+        logger.info(f"[{channel_key}] Пост {post_id}: ✅ Найдено совпадение по ключам: {matched}")
 
         await self.on_relevant_message(
             channel=channel_key,
-            text=text,
+            text=cleaned_text,
             photo=photo_url,
             telethon_message=None
         )
-    async def send_message_to_user(self, user_id: int, text: str, photo=None) -> Optional[int]:
-        return None
 
     async def run_until_disconnected(self):
         while self._running:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(1)
+
+    def stop(self):
+        self._running = False
+        logger.info("Мониторинг каналов остановлен")
