@@ -59,7 +59,7 @@ class ChannelWatcher:
 
         async with aiohttp.ClientSession(timeout=timeout_config) as session:
             for ch in channels:
-                # ИСПРАВЛЕНО: Универсальное извлечение названия канала независимо от структуры данных из БД
+                # Универсальное извлечение названия канала независимо от структуры данных из БД
                 if isinstance(ch, str):
                     channel_key = ch
                 elif isinstance(ch, dict) and "channel" in ch:
@@ -78,14 +78,15 @@ class ChannelWatcher:
                 try:
                     async with session.get(url) as response:
                         if response.status != 200:
-                            logger.error(f"[{channel_key}] Ошибка парсинга: HTTP Status {response.status}")
+                            # Изменено на warning, чтобы ошибки 502/429 от Telegram не засоряли логи уровня error
+                            logger.warning(f"[{channel_key}] Канал временно недоступен: HTTP Status {response.status}")
                             continue
                         html = await response.text()
                 except asyncio.TimeoutError:
-                    logger.error(f"[{channel_key}] Превышено время ожидания ответа (Таймаут сети)")
+                    logger.warning(f"[{channel_key}] Превышено время ожидания ответа от t.me (Таймаут сети)")
                     continue
                 except Exception as e:
-                    logger.error(f"[{channel_key}] Ошибка запроса сети: {e}")
+                    logger.warning(f"[{channel_key}] Ошибка запроса к Telegram: {e}")
                     continue
 
                 soup = BeautifulSoup(html, "html.parser")
@@ -94,7 +95,7 @@ class ChannelWatcher:
                 if not post_elements:
                     continue
 
-                # При первом запуске берем последние 3 поста, чтобы проверить их на ключи
+                # При первом запуске берем последние 3 поста, чтобы полноценно проверить их на ключи
                 elements_to_check = post_elements[-3:] if initial else post_elements
 
                 for elem in elements_to_check:
@@ -108,6 +109,7 @@ class ChannelWatcher:
                         continue
 
                     text_elem = elem.find("div", class_="tgme_widget_message_text")
+                    # Соединяем через пробел, чтобы внутренние теги форматирования не разрывали слова переносом строк
                     text = text_elem.get_text(separator=" ") if text_elem else ""
 
                     photo_url = None
@@ -127,7 +129,7 @@ class ChannelWatcher:
             "тула. происшествия", "тг-канал"
         ]
         
-        # Удаляем ссылки из текста
+        # Удаляем ссылки из текста, не вырезая строки целиком
         text = re.sub(r"https?://\S+", "", text)
         text = re.sub(r"t\.me/\S+", "", text)
         text = re.sub(r"max\.ru/\S+", "", text)
@@ -137,6 +139,7 @@ class ChannelWatcher:
         for line in lines:
             line_lower = line.lower().strip()
             
+            # Вместо break используем continue, чтобы не ломать оставшийся текст поста
             if any(phrase in line_lower for phrase in stop_phrases):
                 continue
             
@@ -151,6 +154,7 @@ class ChannelWatcher:
         if not cleaned_text and not photo_url:
             return
 
+        # Убираем все разрывы строк и множественные пробелы исключительно ради точного поиска совпадений
         text_for_search = re.sub(r"\s+", " ", cleaned_text.lower()).strip()
         matched = [kw for kw in keywords if kw in text_for_search]
 

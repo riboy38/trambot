@@ -1,8 +1,9 @@
 """
 Модуль для работы с базой данных PostgreSQL через asyncpg.
-Содержит все запросы к БД.
+Содержит все запросы к БД. Защищен от внезапных разрывов соединений.
 """
 
+import asyncio
 import asyncpg
 import logging
 from typing import Optional
@@ -19,6 +20,7 @@ async def init_db(database_url: str):
     pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10)
     await create_tables()
     await seed_keywords()
+    await init_seen_posts_table()
     logger.info("База данных инициализирована")
 
 
@@ -60,291 +62,211 @@ async def create_tables():
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
-
-            CREATE TABLE IF NOT EXISTS tram_routes (
-                route_number TEXT PRIMARY KEY,
-                description TEXT NOT NULL,
-                photo_file_id TEXT
-            );
         """)
-    logger.info("Таблицы созданы/проверены")
 
 
 async def seed_keywords():
-    """Установка ключевых слов для мониторинга трамваев."""
-    keywords = [
-        "автомобиль на трамвайных путях",
-        "встала на трамвайных путях",
-        "встали трамваи",
-        "встал трамвай",
-        "движение рельсового транспорта остановлено",
-        "движение трамваев остановлено",
-        "заехал на рельсы",
-        "застрявший на рельсах",
-        "застряла машина на трамвайных путях",
-        "застряла на трамвайных путях",
-        "застряли на трамвайных путях",
-        "застрял на трамвайных путях",
-        "на рельсах застрял",
-        "на рельсах застряла",
-        "на трамвайных путях столкнулись",
-        "остановки движения рельсового транспорта",
-        "остановлено движение трамваев",
-        "перекрыл трамвайные пути",
-        "прекращено трамвайное сообщение",
-        "решил проехать по трамвайным путям",
-        "сел на трамвайные рельсы",
-        "сошел с рельсов",
-        "сошел с рельсов трамвай",
-        "сошёл трамвай с рельсов",
-        "трамваи встали",
-        "трамваи на аварийке",
-        "трамваи не могут проехать",
-        "трамваи сломались",
-        "трамваи стоят",
-        "трамвай на аварийке",
-        "трамвай не может ехать",
-        "трамвай сломался",
-        "трамвай сошел с рельс",
-        "трамвай сошел с рельсов",
-        "трамвай сошёл с рельсов",
-        "трамвая встали",
-    ]
+    """Первоначальное заполнение базовых ключевых слов, если таблица пуста."""
     async with pool.acquire() as conn:
-        # Очищаем старые ключевые слова и устанавливаем новые
-        await conn.execute("DELETE FROM keywords")
-        for word in keywords:
-            await conn.execute(
-                "INSERT INTO keywords (word) VALUES ($1) ON CONFLICT (word) DO NOTHING",
-                word
-            )
-    logger.info(f"Установлено {len(keywords)} ключевых слов")
+        count = await conn.fetchval("SELECT COUNT(*) FROM keywords")
+        if count == 0:
+            base_keywords = [
+                "трамвай", "трамваи", "трамваев", "трамвая", "трамваям",
+                "вагон", "рельс", "рельсы", "рельсов", "сход", "сошел",
+                "ул. марата", "ул. епифанская", "пролетарск", "криволуч",
+                "менделеев", "станиславск", "оборонн", "красноармейск",
+                "советск", "коминтерн", "луначарск", "октябрьск",
+                "задержк", "задержив", "остановл", "встали", "стоят",
+                "движение рельсового", "двухпутно", "однопутно"
+            ]
+            for kw in base_keywords:
+                await conn.execute(
+                    "INSERT INTO keywords (word) VALUES ($1) ON CONFLICT DO NOTHING", kw
+                )
+            logger.info(f"Добавлено {len(base_keywords)} начальных ключевых слов")
+        else:
+            logger.info(f"Установлено {count} ключевых слов")
 
 
-# ─── Подписчики ───────────────────────────────────────────────────────────────
+async def get_source_channels():
+    """Получить список целевых каналов с защитой от разрыва соединения."""
+    for attempt in range(2):
+        try:
+            async with pool.acquire() as conn:
+                return await conn.fetch("SELECT channel FROM source_channels")
+        except asyncpg.exceptions.ConnectionDoesNotExistError:
+            if attempt == 0:
+                logger.warning("Соединение с БД было закрыто сервером. Повторная попытка...")
+                await asyncio.sleep(1)
+            else:
+                raise
+        except Exception as e:
+            if "connection was closed" in str(e).lower() and attempt == 0:
+                logger.warning("Обнаружен разрыв соединения с PostgreSQL. Переподключение...")
+                await asyncio.sleep(1)
+            else:
+                raise
 
-async def add_subscriber(user_id: int) -> bool:
-    """Подписать пользователя. Возвращает True если новый."""
+
+async def get_keywords():
+    """Получить список ключевых слов с защитой от разрыва соединения."""
+    for attempt in range(2):
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("SELECT word FROM keywords")
+                return [row["word"] for row in rows]
+        except asyncpg.exceptions.ConnectionDoesNotExistError:
+            if attempt == 0:
+                logger.warning("Соединение с БД для ключевых слов закрыто. Повторная попытка...")
+                await asyncio.sleep(1)
+            else:
+                raise
+        except Exception as e:
+            if "connection was closed" in str(e).lower() and attempt == 0:
+                logger.warning("Обнаружен разрыв соединения при запросе ключевых слов. Переподключение...")
+                await asyncio.sleep(1)
+            else:
+                raise
+
+
+async def add_channel(channel: str) -> bool:
+    """Добавить канал в список мониторинга."""
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "INSERT INTO subscribers (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
-            user_id
-        )
-        return result == "INSERT 0 1"
+        try:
+            await conn.execute("INSERT INTO source_channels (channel) VALUES ($1)", channel)
+            return True
+        except asyncpg.exceptions.UniqueViolationError:
+            return False
 
 
-async def remove_subscriber(user_id: int):
-    """Отписать пользователя."""
+async def remove_channel(channel: str) -> bool:
+    """Удалить канал из списка мониторинга."""
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM subscribers WHERE user_id = $1", user_id)
-
-
-async def is_subscriber(user_id: int) -> bool:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT 1 FROM subscribers WHERE user_id = $1", user_id)
-        return row is not None
-
-
-async def get_all_subscribers() -> list[int]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id FROM subscribers")
-        return [r["user_id"] for r in rows]
-
-
-async def get_subscribers_count() -> int:
-    async with pool.acquire() as conn:
-        return await conn.fetchval("SELECT COUNT(*) FROM subscribers")
-
-
-# ─── Ключевые слова ──────────────────────────────────────────────────────────
-
-async def get_keywords() -> list[str]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT word FROM keywords ORDER BY word")
-        return [r["word"] for r in rows]
+        res = await conn.execute("DELETE FROM source_channels WHERE channel = $1", channel)
+        return "DELETE 1" in res
 
 
 async def add_keyword(word: str) -> bool:
-    """Добавить ключевое слово. Возвращает True если добавлено."""
+    """Добавить ключевое слово."""
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "INSERT INTO keywords (word) VALUES ($1) ON CONFLICT (word) DO NOTHING",
-            word.lower()
-        )
-        return result == "INSERT 0 1"
+        try:
+            await conn.execute("INSERT INTO keywords (word) VALUES ($1)", word.lower().strip())
+            return True
+        except asyncpg.exceptions.UniqueViolationError:
+            return False
 
 
 async def remove_keyword(word: str) -> bool:
+    """Удалить ключевое слово."""
     async with pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM keywords WHERE word = $1", word.lower())
-        return result == "DELETE 1"
+        res = await conn.execute("DELETE FROM keywords WHERE word = $1", word.lower().strip())
+        return "DELETE 1" in res
 
 
-# ─── Каналы-источники ─────────────────────────────────────────────────────────
-
-async def get_source_channels() -> list[str]:
+async def add_subscriber(user_id: int) -> bool:
+    """Добавить пользователя в базу подписчиков рассылки."""
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT channel FROM source_channels ORDER BY added_at")
-        return [r["channel"] for r in rows]
+        try:
+            await conn.execute("INSERT INTO subscribers (user_id) VALUES ($1)", user_id)
+            return True
+        except asyncpg.exceptions.UniqueViolationError:
+            return False
 
 
-async def add_source_channel(channel: str) -> bool:
+async def remove_subscriber(user_id: int) -> bool:
+    """Удалить пользователя из подписчиков."""
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "INSERT INTO source_channels (channel) VALUES ($1) ON CONFLICT (channel) DO NOTHING",
-            channel
-        )
-        return result == "INSERT 0 1"
+        res = await conn.execute("DELETE FROM subscribers WHERE user_id = $1", user_id)
+        return "DELETE 1" in res
 
 
-async def remove_source_channel(channel: str) -> bool:
+async def is_subscribed(user_id: int) -> bool:
+    """Проверить, подписан ли пользователь."""
     async with pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM source_channels WHERE channel = $1", channel)
-        return result == "DELETE 1"
+        val = await conn.fetchval("SELECT 1 FROM subscribers WHERE user_id = $1", user_id)
+        return val is not None
 
 
-async def get_channels_count() -> int:
+async def get_all_subscribers():
+    """Получить список всех ID подписчиков."""
     async with pool.acquire() as conn:
-        return await conn.fetchval("SELECT COUNT(*) FROM source_channels")
+        rows = await conn.fetch("SELECT user_id FROM subscribers")
+        return [row["user_id"] for row in rows]
 
 
-# ─── Уведомления ─────────────────────────────────────────────────────────────
-
-async def save_notification(
-    user_id: int,
-    message_id: int,
-    text: str,
-    source_channel: str = None,
-    photo_file_id: str = None
-):
-    """Сохранить запись об отправленном уведомлении."""
+async def get_stats() -> dict:
+    """Получить общую статистику для админ-панели."""
     async with pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO sent_notifications
-               (source_channel, message_id_per_user, user_id, text, photo_file_id)
-               VALUES ($1, $2, $3, $4, $5)""",
-            source_channel, message_id, user_id, text, photo_file_id
-        )
+        subs = await conn.fetchval("SELECT COUNT(*) FROM subscribers")
+        chans = await conn.fetchval("SELECT COUNT(*) FROM source_channels")
+        kws = await conn.fetchval("SELECT COUNT(*) FROM keywords")
+        notifs = await conn.fetchval("SELECT COUNT(DISTINCT sent_at) FROM sent_notifications")
+        return {
+            "subscribers": subs,
+            "channels": chans,
+            "keywords": kws,
+            "notifications": notifs or 0
+        }
 
 
-async def get_notifications_history(offset: int = 0, limit: int = 10) -> list[dict]:
-    """Получить историю уведомлений с пагинацией."""
+async def save_notification(user_id: int, message_id_per_user: int, text: str, source_channel: str, photo_file_id: str = None):
+    """Сохранить лог отправленного уведомления."""
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT id, source_channel, text, photo_file_id, sent_at
-               FROM sent_notifications
-               ORDER BY sent_at DESC
-               LIMIT $1 OFFSET $2""",
-            limit, offset
-        )
-        return [dict(r) for r in rows]
+        await conn.execute("""
+            INSERT INTO sent_notifications (source_channel, message_id_per_user, user_id, text, photo_file_id)
+            VALUES ($1, $2, $3, $4, $5)
+        """, source_channel, message_id_per_user, user_id, text, photo_file_id)
 
 
-async def get_notifications_for_deletion(notification_id: int) -> list[dict]:
-    """Получить все записи уведомления для удаления по id одной записи."""
+async def get_notification_history(limit: int = 5, offset: int = 0):
+    """Получить историю уникальных рассылок."""
     async with pool.acquire() as conn:
-        # Получаем текст/источник эталонной записи
-        ref = await conn.fetchrow(
-            "SELECT text, source_channel FROM sent_notifications WHERE id = $1",
-            notification_id
-        )
-        if not ref:
-            return []
-        rows = await conn.fetch(
-            """SELECT id, user_id, message_id_per_user
-               FROM sent_notifications
-               WHERE text = $1 AND source_channel IS NOT DISTINCT FROM $2""",
-            ref["text"], ref["source_channel"]
-        )
-        return [dict(r) for r in rows]
+        return await conn.fetch("""
+            SELECT DISTINCT ON (sent_at) id, source_channel, text, photo_file_id, sent_at
+            FROM sent_notifications
+            ORDER BY sent_at DESC, id DESC
+            LIMIT $1 OFFSET $2
+        """, limit, offset)
 
 
-async def delete_notification_records(notification_id: int):
-    """Удалить все записи уведомления из БД."""
+async def add_suggested_post(user_id: int, text: str, photo_file_id: str = None) -> int:
+    """Сохранить предложенный пост от пользователя."""
     async with pool.acquire() as conn:
-        ref = await conn.fetchrow(
-            "SELECT text, source_channel FROM sent_notifications WHERE id = $1",
-            notification_id
-        )
-        if not ref:
-            return
-        await conn.execute(
-            """DELETE FROM sent_notifications
-               WHERE text = $1 AND source_channel IS NOT DISTINCT FROM $2""",
-            ref["text"], ref["source_channel"]
-        )
+        return await conn.fetchval("""
+            INSERT INTO suggested_posts (user_id, text, photo_file_id)
+            VALUES ($1, $2, $3) RETURNING id
+        """, user_id, text, photo_file_id)
 
 
-async def get_notifications_24h_count() -> int:
+async def get_suggested_post(post_id: int):
+    """Получить предложенный пост по ID."""
     async with pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT COUNT(DISTINCT text) FROM sent_notifications WHERE sent_at > NOW() - INTERVAL '24 hours'"
-        )
-
-
-# ─── Предложения постов ───────────────────────────────────────────────────────
-
-async def create_suggested_post(user_id: int, text: str, photo_file_id: str = None) -> int:
-    """Создать предложение, вернуть id."""
-    async with pool.acquire() as conn:
-        return await conn.fetchval(
-            """INSERT INTO suggested_posts (user_id, text, photo_file_id)
-               VALUES ($1, $2, $3) RETURNING id""",
-            user_id, text, photo_file_id
-        )
-
-
-async def get_pending_post_by_user(user_id: int) -> Optional[dict]:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM suggested_posts WHERE user_id = $1 AND status = 'pending'",
-            user_id
-        )
-        return dict(row) if row else None
-
-
-async def get_suggested_post(post_id: int) -> Optional[dict]:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM suggested_posts WHERE id = $1", post_id)
-        return dict(row) if row else None
+        return await conn.fetchrow("SELECT * FROM suggested_posts WHERE id = $1", post_id)
 
 
 async def update_post_status(post_id: int, status: str):
+    """Обновить статус модерации предложенного поста."""
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE suggested_posts SET status = $1 WHERE id = $2",
-            status, post_id
-        )
+        await conn.execute("UPDATE suggested_posts SET status = $1 WHERE id = $2", status, post_id)
 
 
-async def get_pending_posts_count() -> int:
-    async with pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT COUNT(*) FROM suggested_posts WHERE status = 'pending'"
-        )
-
-
-async def fix_channel_urls():
-    """
-    Исправляет каналы, добавленные как полные ссылки.
-    Например @https://t.me/tula_smi → @tula_smi
-    """
+async def fix_channels_format():
+    """Скрипт миграции (убирает t.me/ ссылки, превращая их в юзернеймы)."""
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT id, channel FROM source_channels")
         for row in rows:
             channel = row["channel"]
-            # Убираем лишнее: @https://t.me/ или https://t.me/
             if "t.me/" in channel:
                 clean = "@" + channel.split("t.me/")[-1].strip("/")
                 await conn.execute(
                     "UPDATE source_channels SET channel = $1 WHERE id = $2",
                     clean, row["id"]
                 )
-                logger.info(f"Исправлен канал: {channel!r} → {clean!r}")
+                logger.info(f"Исправлен формат ссылки канала: {channel!r} → {clean!r}")
 
 
 async def init_seen_posts_table():
-    """Создаём таблицу для хранения уже обработанных постов."""
+    """Создать таблицу для хранения уже обработанных постов."""
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS seen_posts (
@@ -353,14 +275,14 @@ async def init_seen_posts_table():
                 seen_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-        # Удаляем записи старше 7 дней чтобы таблица не разрасталась
+        # Автоматическая очистка: удаляем записи старше 7 дней
         await conn.execute("""
             DELETE FROM seen_posts WHERE seen_at < NOW() - INTERVAL '7 days'
         """)
 
 
 async def is_post_seen(post_id: str) -> bool:
-    """Проверить был ли пост уже обработан."""
+    """Проверить, был ли пост уже обработан парсером."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT 1 FROM seen_posts WHERE post_id = $1", post_id
@@ -369,48 +291,10 @@ async def is_post_seen(post_id: str) -> bool:
 
 
 async def mark_post_seen(post_id: str, channel: str):
-    """Отметить пост как обработанный."""
+    """Отметить ID поста как обработанный."""
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO seen_posts (post_id, channel) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            post_id, channel
-        )
-
-
-# ─── Управление маршрутами ───────────────────────────────────────────────────
-
-async def get_all_routes() -> list[dict]:
-    """Получить список всех сохраненных маршрутов."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT route_number, description, photo_file_id FROM tram_routes ORDER BY route_number")
-        return [dict(r) for r in rows]
-
-
-async def get_route(route_number: str) -> Optional[dict]:
-    """Получить информацию о конкретном маршруте."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT route_number, description, photo_file_id FROM tram_routes WHERE route_number = $1",
-            route_number
-        )
-        return dict(row) if row else None
-
-
-async def add_or_update_route(route_number: str, description: str, photo_file_id: str = None) -> bool:
-    """Добавить новый или обновить существующий маршрут."""
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO tram_routes (route_number, description, photo_file_id) 
-               VALUES ($1, $2, $3)
-               ON CONFLICT (route_number) 
-               DO UPDATE SET description = EXCLUDED.description, photo_file_id = EXCLUDED.photo_file_id""",
-            route_number, description, photo_file_id
-        )
-        return True
-
-
-async def remove_route(route_number: str) -> bool:
-    """Удалить маршрут по его номеру."""
-    async with pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM tram_routes WHERE route_number = $1", route_number)
-        return result == "DELETE 1"
+        await conn.execute("""
+            INSERT INTO seen_posts (post_id, channel) 
+            VALUES ($1, $2) 
+            ON CONFLICT (post_id) DO NOTHING
+        """, post_id, channel)
