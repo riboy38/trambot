@@ -250,7 +250,8 @@ async def update_post_status(post_id: int, status: str):
         await conn.execute("UPDATE suggested_posts SET status = $1 WHERE id = $2", status, post_id)
 
 
-async def fix_channels_format():
+# ИСПРАВЛЕНО: Переименовано в fix_channel_urls для точного соответствия вызову из main.py
+async def fix_channel_urls():
     """Скрипт миграции (убирает t.me/ ссылки, превращая их в юзернеймы)."""
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT id, channel FROM source_channels")
